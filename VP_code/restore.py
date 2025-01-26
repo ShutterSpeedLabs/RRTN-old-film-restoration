@@ -4,6 +4,7 @@ import cv2
 import importlib
 import argparse
 import yaml
+from tqdm import tqdm
 
 sys.path.append(os.path.dirname(sys.path[0]))
 
@@ -39,34 +40,35 @@ def load_model(opts, which_model='first'):
 
 
 def load_dataset(config_dict):
-
     val_dataset = Film_dataset_1(config_dict['datasets']['val'])
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False, sampler=None)
     print("Finish loading dataset ...")
     print("Test set statistics:")
     print(f'\n\tNumber of test videos: {len(val_dataset)}')
-
     return val_loader
 
 
 def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
-
     psnr = 0.0
     loaded_model.eval()
 
-    for val_data in val_loader:
-
+    video_pbar = tqdm(val_loader, desc=f"Processing videos (Recursion {recursion_step})", leave=True)
+    
+    for val_data in video_pbar:
         val_frame_num = config_dict['val']['val_frame_num']
         all_len = val_data['lq'].shape[1]
         all_output = []
 
         clip_name, _ = val_data['key'][0].split('/')
         test_clip_par_folder = val_data['video_name'][0]
-
         frame_name_list = val_data['name_list']
 
         part_output = None
-        for i in range(0, all_len, opts.temporal_stride):
+        frame_pbar = tqdm(range(0, all_len, opts.temporal_stride), 
+                         desc=f"Processing frames for {clip_name}", 
+                         leave=False)
+        
+        for i in frame_pbar:
             current_part = {}
             current_part['lq'] = val_data['lq'][:, i:min(i + val_frame_num, all_len), :, :, :]
             current_part['gt'] = val_data['gt'][:, i:min(i + val_frame_num, all_len), :, :, :]
@@ -88,7 +90,7 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
                 restored_temporal_length = min(i + val_frame_num, all_len) - i - (
                     val_frame_num - opts.temporal_stride)
                 all_output.append(part_output[:, 0 - restored_temporal_length:, :, :, :]
-                                  .detach().cpu().squeeze(0))
+                                .detach().cpu().squeeze(0))
 
             del part_lq
 
@@ -106,13 +108,17 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
 
         gt_imgs = []
         sr_imgs = []
-        for j in range(len(val_output)):
+        
+        img_pbar = tqdm(range(len(val_output)), desc="Converting tensors to images", leave=False)
+        for j in img_pbar:
             gt_imgs.append(tensor2img(gt[j]))
             sr_imgs.append(tensor2img(val_output[j]))
 
-        # Save the image
-        for id, sr_img in enumerate(sr_imgs):
-            save_place = os.path.join(opts.save_place, opts.name, 'test_results_' + str(opts.temporal_length) + "_rec" + str(recursion_step), test_clip_par_folder, clip_name, frame_name_list[id][0])
+        save_pbar = tqdm(enumerate(sr_imgs), desc="Saving processed images", leave=False)
+        for id, sr_img in save_pbar:
+            save_place = os.path.join(opts.save_place, opts.name, 
+                                    'test_results_' + str(opts.temporal_length) + "_rec" + str(recursion_step), 
+                                    test_clip_par_folder, clip_name, frame_name_list[id][0])
             dir_name = os.path.abspath(os.path.dirname(save_place))
             os.makedirs(dir_name, exist_ok=True)
             cv2.imwrite(save_place, sr_img)
@@ -122,16 +128,24 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
         else:
             input_clip_url = os.path.join(opts.input_video_url, test_clip_par_folder, clip_name)
 
-        restored_clip_url = os.path.join(opts.save_place, opts.name, 'test_results_' + str(opts.temporal_length) + "_rec" + str(recursion_step), test_clip_par_folder, clip_name)
-        video_save_url = os.path.join(opts.save_place, opts.name, 'test_results_' + str(opts.temporal_length) + "_rec" + str(recursion_step), test_clip_par_folder, clip_name + '.avi')
+        restored_clip_url = os.path.join(opts.save_place, opts.name, 
+                                       'test_results_' + str(opts.temporal_length) + "_rec" + str(recursion_step), 
+                                       test_clip_par_folder, clip_name)
+        video_save_url = os.path.join(opts.save_place, opts.name, 
+                                     'test_results_' + str(opts.temporal_length) + "_rec" + str(recursion_step), 
+                                     test_clip_par_folder, clip_name + '.avi')
+        
+        print(f"Converting frames to video for {clip_name}")
         frame_to_video(input_clip_url, restored_clip_url, video_save_url)
 
-        psnr_this_video = [calculate_psnr(sr, gt) for sr, gt in zip(sr_imgs, gt_imgs)]
+        psnr_pbar = tqdm(zip(sr_imgs, gt_imgs), total=len(sr_imgs), desc="Calculating PSNR", leave=False)
+        psnr_this_video = [calculate_psnr(sr, gt) for sr, gt in psnr_pbar]
         psnr += sum(psnr_this_video) / len(psnr_this_video)
 
-    psnr /= len(val_loader)
+        video_pbar.set_postfix({'Current PSNR': f"{psnr_this_video[-1]:.2f}"})
 
-    print(f'# PSNR between input and output: {psnr}')
+    psnr /= len(val_loader)
+    print(f'# Average PSNR: {psnr:.2f}')
     return psnr
 
 
@@ -160,6 +174,7 @@ if __name__ == '__main__':
     config_dict['datasets']['val']['dataroot_lq'] = opts.input_video_url
     config_dict['val']['val_frame_num'] = opts.temporal_length
 
+    print("Loading model...")
     loaded_model = load_model(opts, which_model='first')
     val_loader = load_dataset(config_dict)
 
