@@ -153,10 +153,11 @@ def frame_to_video(input_frame_url, restored_frame_url, save_place):
     output_frames, height, width = get_frames_output(restored_frame_url)
     input_frames = get_frames_input(input_frame_url, width, height)
     fourcc=cv2.VideoWriter_fourcc(*'MJPG')
-    video=cv2.VideoWriter(save_place,fourcc,15,(width,height*2))
+    video=cv2.VideoWriter(save_place,fourcc,15,(width*2,height))
 
     for j in range(min(len(input_frames),len(output_frames))):
-        temp=cv2.vconcat([input_frames[j],output_frames[j]])
+        #temp=cv2.vconcat([input_frames[j],output_frames[j]])
+        temp=cv2.hconcat([input_frames[j],output_frames[j]])
         video.write(temp)
 
     video.release()
