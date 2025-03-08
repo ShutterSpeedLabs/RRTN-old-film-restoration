@@ -2,3 +2,4 @@ __pycache__/
 
 pretrained_models/*
 OUTPUT/
+test_data_sample/
