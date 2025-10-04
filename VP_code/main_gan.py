@@ -57,7 +57,7 @@ if __name__ == '__main__':
 
     # DDP
     parser.add_argument('--nodes', type=int, default=1, help='how many machines')
-    parser.add_argument('--gpus', type=int, default=1, help='how many GPUs in one node')
+    parser.add_argument('--gpus', type=int, default=2, help='how many GPUs in one node')
     parser.add_argument('--node_rank', type=int, default=0, help='the id of this machine (default: only one machine with id 0)')
     parser.add_argument('--dist_url', type=str, default="", help='Port Address')
 

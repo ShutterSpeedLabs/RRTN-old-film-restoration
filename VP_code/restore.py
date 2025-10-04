@@ -5,6 +5,9 @@ import importlib
 import argparse
 import yaml
 from tqdm import tqdm
+import torch.nn as nn
+import gc
+import time
 
 sys.path.append(os.path.dirname(sys.path[0]))
 
@@ -16,6 +19,34 @@ from VP_code.utils.data_util import tensor2img
 from VP_code.metrics.psnr_ssim import calculate_psnr
 
 from torch.utils.data import DataLoader
+
+
+def get_device():
+    """Get the best available device (CUDA or CPU)"""
+    if torch.cuda.is_available():
+        n_gpus = torch.cuda.device_count()
+        print(f"Found {n_gpus} GPU(s)")
+        if n_gpus >= 2:
+            print("Using multiple GPUs")
+            return 'cuda', True
+        else:
+            print("Using single GPU")
+            return 'cuda', False
+    else:
+        print("No GPU found, using CPU")
+        return 'cpu', False
+
+
+def get_gpu_memory():
+    """Get available memory for each GPU in GB"""
+    available_memory = []
+    for i in range(torch.cuda.device_count()):
+        total_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3  # Convert to GB
+        reserved = torch.cuda.memory_reserved(i) / 1024**3
+        allocated = torch.cuda.memory_allocated(i) / 1024**3
+        available = total_memory - (reserved + allocated)
+        available_memory.append(available)
+    return available_memory
 
 
 def load_model(opts, which_model='first'):
@@ -31,9 +62,13 @@ def load_model(opts, which_model='first'):
     else:
         raise ValueError('`which_model` should be "first" or "second"')
 
-    checkpoint = torch.load(model_path)
+    device, use_multi_gpu = get_device()
+    checkpoint = torch.load(model_path, map_location=device)
     netG.load_state_dict(checkpoint['netG'])
-    netG.cuda()
+    
+    if use_multi_gpu:
+        netG = nn.DataParallel(netG)
+    netG.to(device)
     print("Finish loading model ...")
 
     return netG
@@ -51,6 +86,7 @@ def load_dataset(config_dict):
 def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
     psnr = 0.0
     loaded_model.eval()
+    device = next(loaded_model.parameters()).device
 
     video_pbar = tqdm(val_loader, desc=f"Processing videos (Recursion {recursion_step})", leave=True)
     
@@ -64,38 +100,51 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
         frame_name_list = val_data['name_list']
 
         part_output = None
-        frame_pbar = tqdm(range(0, all_len, opts.temporal_stride), 
+        # Calculate optimal batch size based on available GPU memory
+        available_memory = get_gpu_memory()
+        min_memory = min(available_memory)
+        batch_size = min(opts.temporal_length, max(1, int(min_memory * 0.4)))  # Use 40% of available memory
+        print(f"Processing with batch size: {batch_size}")
+
+        frame_pbar = tqdm(range(0, all_len, batch_size), 
                          desc=f"Processing frames for {clip_name}", 
                          leave=False)
         
         for i in frame_pbar:
+            # Clear memory before processing each batch
+            torch.cuda.empty_cache()
+            gc.collect()
+
             current_part = {}
-            current_part['lq'] = val_data['lq'][:, i:min(i + val_frame_num, all_len), :, :, :]
-            current_part['gt'] = val_data['gt'][:, i:min(i + val_frame_num, all_len), :, :, :]
+            end_idx = min(i + batch_size, all_len)
+            current_part['lq'] = val_data['lq'][:, i:end_idx, :, :, :]
+            current_part['gt'] = val_data['gt'][:, i:end_idx, :, :, :]
             current_part['key'] = val_data['key']
-            current_part['frame_list'] = val_data['frame_list'][i:min(i + val_frame_num, all_len)]
+            current_part['frame_list'] = val_data['frame_list'][i:end_idx]
 
-            part_lq = current_part['lq'].cuda()
-
+            # Process on GPUs with memory monitoring
             with torch.no_grad():
                 try:
+                    part_lq = current_part['lq'].to(device)
                     part_output = loaded_model(part_lq)
+                    part_output = part_output.cpu()
+                    del part_lq
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
                 except RuntimeError as e:
-                    print("Warning: runtime error", e)
-                    part_output = part_lq.clone()
+                    print(f"Warning: runtime error - {e}")
+                    print("Reducing batch size and retrying...")
+                    batch_size = max(1, batch_size // 2)
+                    part_output = current_part['lq'].clone()
 
+            # Process output
             if i == 0:
-                all_output.append(part_output.detach().cpu().squeeze(0))
+                all_output.append(part_output.squeeze(0))
             else:
-                restored_temporal_length = min(i + val_frame_num, all_len) - i - (
-                    val_frame_num - opts.temporal_stride)
-                all_output.append(part_output[:, 0 - restored_temporal_length:, :, :, :]
-                                .detach().cpu().squeeze(0))
+                all_output.append(part_output.squeeze(0))
 
-            del part_lq
-
-            if (i + val_frame_num) >= all_len:
-                break
+            del current_part
+            gc.collect()
 
         val_output = torch.cat(all_output, dim=0)
         gt = val_data['gt'].squeeze(0)
@@ -149,6 +198,68 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
     return psnr
 
 
+def process_single_folder(opts, config_dict, folder_path):
+    """Process a single video folder"""
+    print(f"\n{'='*50}")
+    print(f"Processing {os.path.basename(folder_path)}")
+    print(f"{'='*50}")
+    
+    # Set input paths for current folder
+    config_dict['datasets']['val']['dataroot_gt'] = folder_path
+    config_dict['datasets']['val']['dataroot_lq'] = folder_path
+    config_dict['val']['val_frame_num'] = opts.temporal_length
+
+    # First recursion
+    print("Loading first model...")
+    loaded_model = load_model(opts, which_model='first')
+    val_loader = load_dataset(config_dict)
+    
+    print('=======')
+    print('Recursion: 1')
+    psnr = validation(opts, config_dict, loaded_model, val_loader, recursion_step=1)
+    
+    # Clear first model
+    del loaded_model
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Further recursions
+    print("Loading second model...")
+    loaded_model = load_model(opts, which_model='second')
+    for i in range(opts.max_recursion - 1):
+        if psnr >= opts.recursion_threshold:
+            break
+
+        recursion_step = i + 2
+        print('=======')
+        print(f'Recursion: {recursion_step}')
+
+        video_url = os.path.join(
+            opts.save_place,
+            opts.name,
+            'test_results_' + str(opts.temporal_length) + f"_rec{recursion_step-1}",
+            os.path.basename(folder_path)
+        )
+        config_dict['datasets']['val']['dataroot_gt'] = video_url
+        config_dict['datasets']['val']['dataroot_lq'] = video_url
+
+        val_loader = load_dataset(config_dict)
+        psnr = validation(opts, config_dict, loaded_model, val_loader, recursion_step=recursion_step)
+
+    # Clear second model
+    del loaded_model
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+def wait_for_user():
+    """Wait for user confirmation before proceeding"""
+    print("\nFolder processing completed. Press Enter when ready to process next folder...")
+    input()
+    # Additional delay to ensure GPU memory is cleared
+    time.sleep(5)
+
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
@@ -162,45 +273,34 @@ if __name__ == '__main__':
     parser.add_argument('--recursion_threshold', type=float, default=43, help='Threshold for further recursion. If PSNR between the input video and output video is smaller than the threshold, the recursion will be continued. Default is 43.')
     parser.add_argument('--max_recursion', type=int, default=4, help='Max recursion steps. Default is 4.')
     parser.add_argument('--save_place', type=str, default='OUTPUT', help='save place')
-
+    parser.add_argument('--batch_size', type=int, default=5, help='Initial batch size for processing')
+    
     opts = parser.parse_args()
 
     with open(os.path.join('./configs', opts.name + '.yaml'), 'r') as stream:
         config_dict = yaml.safe_load(stream)
 
-    # ===================
-    # The first recursion
-    config_dict['datasets']['val']['dataroot_gt'] = opts.input_video_url
-    config_dict['datasets']['val']['dataroot_lq'] = opts.input_video_url
-    config_dict['val']['val_frame_num'] = opts.temporal_length
+    # Get list of video folders
+    video_folders = [d for d in os.listdir(opts.input_video_url) 
+                    if os.path.isdir(os.path.join(opts.input_video_url, d))]
+    video_folders.sort()  # Process in sorted order
 
-    print("Loading model...")
-    loaded_model = load_model(opts, which_model='first')
-    val_loader = load_dataset(config_dict)
+    print(f"\nFound {len(video_folders)} folders to process:")
+    for i, folder in enumerate(video_folders, 1):
+        print(f"{i}. {folder}")
 
-    print('=======')
-    print('Recursion: 1')
-    psnr = validation(opts, config_dict, loaded_model, val_loader, recursion_step=1)
-
-    # ===================
-    # Further recursions
-    loaded_model = load_model(opts, which_model='second')
-    for i in range(opts.max_recursion - 1):
-        if psnr >= opts.recursion_threshold:
-            break
-
-        recursion_step = i + 2
-        print('=======')
-        print(f'Recursion: {recursion_step}')
-
-        video_url = os.path.join(
-            opts.save_place,
-            opts.name,
-            'test_results_' + str(opts.temporal_length) + "_rec" + str(recursion_step - 1)
-        )
-        config_dict['datasets']['val']['dataroot_gt'] = video_url
-        config_dict['datasets']['val']['dataroot_lq'] = video_url
-
-        val_loader = load_dataset(config_dict)
-
-        psnr = validation(opts, config_dict, loaded_model, val_loader, recursion_step=recursion_step)
+    # Process each folder with user confirmation
+    for i, folder in enumerate(video_folders, 1):
+        print(f"\nPreparing to process folder {i}/{len(video_folders)}: {folder}")
+        folder_path = os.path.join(opts.input_video_url, folder)
+        
+        process_single_folder(opts, config_dict, folder_path)
+        
+        # Force cleanup between folders
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        if i < len(video_folders):  # Don't wait after last folder
+            wait_for_user()
+        
+        print(f"Completed {i}/{len(video_folders)} folders")
