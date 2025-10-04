@@ -318,20 +318,26 @@ if __name__ == '__main__':
     parser.add_argument('--save_place', type=str, default='OUTPUT', help='save place')
 
     # DDP arguments
-    parser.add_argument('--gpus', type=int, default=2, help='how many GPUs in one node')
+    parser.add_argument('--gpus', type=int, default=None, help='how many GPUs in one node (default: auto-detect)')
     parser.add_argument('--node_rank', type=int, default=0, help='the id of this machine (default: only one machine with id 0)')
     parser.add_argument('--dist_url', type=str, default="", help='Port Address')
 
     opts = parser.parse_args()
     opts.isTrain = False
 
-    # Validate GPU count
+    # Auto-detect and validate GPU count
     if torch.cuda.is_available():
         available_gpus = torch.cuda.device_count()
-        if opts.gpus > available_gpus:
+        
+        # If not specified, use all available GPUs (up to 2)
+        if opts.gpus is None:
+            opts.gpus = min(available_gpus, 2)
+            print(f"Auto-detected {available_gpus} GPU(s), using {opts.gpus} for inference")
+        elif opts.gpus > available_gpus:
             print(f"Warning: Requested {opts.gpus} GPUs but only {available_gpus} available. Using {available_gpus} GPUs.")
             opts.gpus = available_gpus
-        print(f"Using {opts.gpus} GPU(s) for inference")
+        else:
+            print(f"Using {opts.gpus} GPU(s) for inference")
     else:
         print("Warning: CUDA not available, falling back to CPU")
         opts.gpus = 1
