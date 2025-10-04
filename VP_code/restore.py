@@ -23,7 +23,7 @@ from VP_code.metrics.psnr_ssim import calculate_psnr
 
 
 def main_worker(local_rank, config_dict, opts):
-    if opts.distributed:
+    if opts.distributed and torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         print(f'using GPU {local_rank} for inference')
 
@@ -34,6 +34,9 @@ def main_worker(local_rank, config_dict, opts):
             rank=local_rank,
             group_name='mtorch'
         )
+    elif torch.cuda.is_available():
+        torch.cuda.set_device(0)
+        print('using single GPU for inference')
 
     opts.local_rank = local_rank
     opts.global_rank = local_rank  # For single node, global_rank = local_rank
@@ -70,7 +73,8 @@ def main_inference(config_dict, opts):
         process_single_folder(opts, config_dict, folder_path)
 
         # Force cleanup between folders
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
 
         print(f"Completed {i}/{len(video_folders)} folders")
@@ -95,11 +99,14 @@ def load_model(opts, which_model='first'):
     netG.load_state_dict(checkpoint['netG'])
 
     # Move to GPU and wrap with DDP if distributed
-    if opts.distributed:
+    if opts.distributed and torch.cuda.is_available():
         netG.cuda(opts.local_rank)
         netG = DDP(netG, device_ids=[opts.local_rank], find_unused_parameters=True)
-    else:
+    elif torch.cuda.is_available():
         netG.cuda()
+    else:
+        print("Warning: CUDA not available, using CPU")
+        netG.cpu()
 
     print("Finish loading model ...")
     return netG
@@ -164,7 +171,9 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
             current_part['key'] = val_data['key']
             current_part['frame_list'] = val_data['frame_list'][i:min(i + val_frame_num, all_len)]
 
-            part_lq = current_part['lq'].cuda()
+            part_lq = current_part['lq']
+            if torch.cuda.is_available():
+                part_lq = part_lq.cuda()
 
             with torch.no_grad():
                 try:
@@ -174,20 +183,22 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
                     else:
                         model = loaded_model
                     part_output = model(part_lq)
+                    if torch.cuda.is_available():
+                        part_output = part_output.cpu()
                 except RuntimeError as e:
                     print("Warning: runtime error", e)
                     part_output = part_lq.clone()
 
             if i == 0:
-                all_output.append(part_output.detach().cpu().squeeze(0))
+                all_output.append(part_output.detach().squeeze(0))
             else:
                 restored_temporal_length = min(i + val_frame_num, all_len) - i - (
                     val_frame_num - opts.temporal_stride)
                 all_output.append(part_output[:, 0 - restored_temporal_length:, :, :, :]
-                                .detach().cpu().squeeze(0))
+                                .detach().squeeze(0))
 
             del part_lq
-            if opts.distributed:
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         val_output = torch.cat(all_output, dim=0)
@@ -197,6 +208,9 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
             val_output = (val_output + 1) / 2
             gt = (gt + 1) / 2
             lq = (lq + 1) / 2
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         gt_imgs = []
         sr_imgs = []
@@ -256,7 +270,8 @@ def process_single_folder(opts, config_dict, folder_path):
 
     # Clear first model
     del loaded_model
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()
 
     # Further recursions
@@ -284,7 +299,8 @@ def process_single_folder(opts, config_dict, folder_path):
 
     # Clear second model
     del loaded_model
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()
 
 
@@ -303,12 +319,29 @@ if __name__ == '__main__':
     parser.add_argument('--save_place', type=str, default='OUTPUT', help='save place')
 
     # DDP arguments
-    parser.add_argument('--gpus', type=int, default=2, help='how many GPUs in one node')
+    parser.add_argument('--gpus', type=int, default=None, help='how many GPUs in one node (default: auto-detect)')
     parser.add_argument('--node_rank', type=int, default=0, help='the id of this machine (default: only one machine with id 0)')
     parser.add_argument('--dist_url', type=str, default="", help='Port Address')
 
     opts = parser.parse_args()
     opts.isTrain = False
+
+    # Auto-detect available GPUs if not specified
+    if opts.gpus is None:
+        if torch.cuda.is_available():
+            opts.gpus = torch.cuda.device_count()
+            print(f"Auto-detected {opts.gpus} GPU(s)")
+        else:
+            opts.gpus = 1
+            print("No GPUs detected, using CPU")
+
+    # Validate GPU count
+    if torch.cuda.is_available():
+        available_gpus = torch.cuda.device_count()
+        if opts.gpus > available_gpus:
+            print(f"Warning: Requested {opts.gpus} GPUs but only {available_gpus} available. Using {available_gpus} GPUs.")
+            opts.gpus = available_gpus
+
     opts.world_size = opts.gpus
 
     with open(os.path.join('./configs', opts.name + '.yaml'), 'r') as stream:
@@ -319,9 +352,17 @@ if __name__ == '__main__':
         port_num = str(random.randint(20000, 30000))
         opts.dist_url = 'tcp://127.0.0.1:' + port_num
 
-    if opts.gpus > 1:
+    # Validate GPU setup
+    if opts.gpus > 1 and not torch.cuda.is_available():
+        print("Error: Multiple GPUs requested but CUDA is not available. Using single GPU mode.")
+        opts.gpus = 1
+        opts.distributed = False
+    elif opts.gpus == 1:
+        opts.distributed = False
+    else:
         opts.distributed = True
+
+    if opts.distributed:
         mp.spawn(main_worker, nprocs=opts.gpus, args=(config_dict, opts,))
     else:
-        opts.distributed = False
         main_inference(config_dict, opts)
