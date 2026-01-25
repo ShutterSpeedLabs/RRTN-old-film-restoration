@@ -143,7 +143,7 @@ def load_dataset(config_dict, opts):
 
 
 def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
-    """Memory-efficient validation with frame-by-frame processing"""
+    """Memory-efficient validation with sliding window processing"""
     total_psnr = 0.0
     video_count = 0
 
@@ -169,58 +169,79 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
                                 test_clip_par_folder, clip_name)
         os.makedirs(output_dir, exist_ok=True)
 
-        # Process frames one by one to minimize RAM usage
+        # Process frames in chunks (sliding window) to use temporal information
         frame_psnr_values = []
         
-        frame_pbar = tqdm(range(all_len), desc=f"Processing frames for {clip_name}", leave=False)
+        # Initialize frame progress bar
+        frame_pbar = tqdm(total=all_len, desc=f"Processing frames for {clip_name}", leave=False)
         
-        for frame_idx in frame_pbar:
-            # Get single frame data
-            frame_lq = val_data['lq'][:, frame_idx:frame_idx+1, :, :, :]
-            frame_gt = val_data['gt'][:, frame_idx:frame_idx+1, :, :, :]
-            frame_name = frame_name_list[frame_idx][0]
+        for start_idx in range(0, all_len, opts.temporal_length):
+            end_idx = min(start_idx + opts.temporal_length, all_len)
+            current_batch_size = end_idx - start_idx
+
+            # Get chunk data: [1, T, C, H, W]
+            chunk_lq = val_data['lq'][:, start_idx:end_idx, :, :, :]
+            chunk_gt = val_data['gt'][:, start_idx:end_idx, :, :, :]
 
             # Move to device
             if torch.cuda.is_available():
-                frame_lq = frame_lq.cuda()
+                chunk_lq = chunk_lq.cuda()
 
-            # Process frame
+            # Process chunk
             with torch.no_grad():
                 try:
-                    frame_output = model(frame_lq)
+                    chunk_output = model(chunk_lq)
                     # Move to CPU immediately
-                    frame_output = frame_output.cpu()
-                    frame_lq_cpu = frame_lq.cpu()
+                    chunk_output = chunk_output.cpu()
+                    chunk_lq_cpu = chunk_lq.cpu() # Keep reference for cleanup
                 except RuntimeError as e:
-                    print(f"Warning: runtime error for frame {frame_name}: {e}")
-                    frame_output = frame_lq.cpu().clone()
-                    frame_lq_cpu = frame_lq.cpu()
+                    print(f"Warning: runtime error for frames {start_idx}-{end_idx}: {e}")
+                    # Fallback: just copy input if model fails
+                    chunk_output = chunk_lq.cpu().clone()
+                    chunk_lq_cpu = chunk_lq.cpu()
 
-            # Denormalize if needed
+            # Denormalize if needed (vectorized)
             if config_dict['datasets']['val']['normalizing']:
-                frame_output = (frame_output + 1) / 2
-                frame_gt = (frame_gt + 1) / 2
+                chunk_output = (chunk_output + 1) / 2
+                chunk_gt = (chunk_gt + 1) / 2
 
-            # Convert to images
-            gt_img = tensor2img(frame_gt.squeeze(0).squeeze(0))
-            sr_img = tensor2img(frame_output.squeeze(0).squeeze(0))
+            # Save individual frames and calculate PSNR
+            for i in range(current_batch_size):
+                frame_idx = start_idx + i
+                frame_name = frame_name_list[frame_idx][0]
+                
+                # Extract single frame tensors [C, H, W]
+                # chunk_output is [1, T, C, H, W], so get [0, i, ...]
+                sr_tensor = chunk_output[0, i, :, :, :]
+                gt_tensor = chunk_gt[0, i, :, :, :]
+                
+                # Convert to images
+                gt_img = tensor2img(gt_tensor)
+                sr_img = tensor2img(sr_tensor)
 
-            # Save image immediately
-            save_path = os.path.join(output_dir, frame_name)
-            cv2.imwrite(save_path, sr_img)
+                # Save image immediately
+                save_path = os.path.join(output_dir, frame_name)
+                cv2.imwrite(save_path, sr_img)
 
-            # Calculate PSNR for this frame
-            frame_psnr = calculate_psnr(sr_img, gt_img)
-            frame_psnr_values.append(frame_psnr)
+                # Calculate PSNR for this frame
+                frame_psnr = calculate_psnr(sr_img, gt_img)
+                frame_psnr_values.append(frame_psnr)
+                
+                # Clean up extracted numpy arrays
+                del gt_img, sr_img
 
-            # Aggressive memory cleanup
-            del frame_lq, frame_gt, frame_output, frame_lq_cpu, gt_img, sr_img
+            # Update progress bar
+            frame_pbar.update(current_batch_size)
+
+            # Aggressive memory cleanup for the chunk
+            del chunk_lq, chunk_gt, chunk_output, chunk_lq_cpu
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
             # Periodic garbage collection
-            if frame_idx % 10 == 0:
-                gc.collect()
+            gc.collect()
+
+        frame_pbar.close()
 
         # Calculate average PSNR for this video
         video_psnr = sum(frame_psnr_values) / len(frame_psnr_values) if frame_psnr_values else 0.0
