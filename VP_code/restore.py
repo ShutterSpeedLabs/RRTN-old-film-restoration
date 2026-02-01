@@ -394,6 +394,7 @@ if __name__ == '__main__':
     parser.add_argument('--gpus', type=int, default=None, help='how many GPUs in one node (default: auto-detect)')
     parser.add_argument('--node_rank', type=int, default=0, help='the id of this machine (default: only one machine with id 0)')
     parser.add_argument('--dist_url', type=str, default="", help='Port Address')
+    parser.add_argument('--local-rank', type=int, default=0, help='local rank for torch.distributed.launch (ignored, used by launcher only)')
 
     opts = parser.parse_args()
     opts.isTrain = False
