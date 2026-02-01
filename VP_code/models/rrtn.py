@@ -1,7 +1,17 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
-from mmcv.ops import ModulatedDeformConv2d, modulated_deform_conv2d
+
+# Try to import from mmcv, fallback to shim if not available
+try:
+    from mmcv.ops import ModulatedDeformConv2d, modulated_deform_conv2d
+except (ImportError, ModuleNotFoundError):
+    import sys
+    import os
+    # Add parent directory to path for shim import
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    from mmcv_deform_shim import ModulatedDeformConv2d, modulated_deform_conv2d
+
 from mmengine.model.weight_init import constant_init
 
 try:
