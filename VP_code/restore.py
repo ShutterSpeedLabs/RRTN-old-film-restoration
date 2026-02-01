@@ -41,6 +41,13 @@ def main_worker(local_rank, config_dict, opts):
     opts.local_rank = local_rank
     opts.global_rank = local_rank  # For single node, global_rank = local_rank
 
+    # Optimize GPU computation (Priority 1 optimization)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.backends.cudnn.benchmark = True  # Enable auto-tuning for faster kernels
+        torch.backends.cudnn.deterministic = False  # Allow faster but non-deterministic ops
+        print("GPU optimizations enabled: cuDNN benchmark=True")
+
     # Run main inference
     main_inference(config_dict, opts)
 
@@ -81,7 +88,7 @@ def main_inference(config_dict, opts):
 
 
 def load_model(opts, which_model='first'):
-    """Load model with distributed support"""
+    """Load model with distributed support and optimizations"""
     assert which_model in ['first', 'second']
 
     net = importlib.import_module('VP_code.models.' + opts.model_name)
@@ -94,9 +101,19 @@ def load_model(opts, which_model='first'):
     else:
         raise ValueError('`which_model` should be "first" or "second"')
 
-    # Load checkpoint
-    checkpoint = torch.load(model_path, map_location='cpu')
+    # Priority 1 Optimization: Load checkpoint directly to target GPU device
+    if torch.cuda.is_available():
+        if opts.distributed:
+            device = torch.device(f'cuda:{opts.local_rank}')
+        else:
+            device = torch.device('cuda:0')
+        checkpoint = torch.load(model_path, map_location=device)
+    else:
+        checkpoint = torch.load(model_path, map_location='cpu')
+    
     netG.load_state_dict(checkpoint['netG'])
+    del checkpoint  # Free memory immediately
+    print(f"Model loaded directly to {device if torch.cuda.is_available() else 'CPU'}")
 
     # Move to GPU and wrap with DDP if distributed
     if opts.distributed and torch.cuda.is_available():
@@ -108,7 +125,12 @@ def load_model(opts, which_model='first'):
         print("Warning: CUDA not available, using CPU")
         netG.cpu()
 
-    print("Finish loading model ...")
+    # Priority 1 Optimization: Disable gradient computation for inference
+    netG.eval()
+    for param in netG.parameters():
+        param.requires_grad = False
+
+    print("Finish loading model with inference optimizations ...")
     return netG
 
 
@@ -122,9 +144,14 @@ def load_dataset(config_dict, opts):
     else:
         val_sampler = None
 
-    # Optimize for GPU: use workers for data loading to overlap with GPU computation
-    # Use 2-4 workers to prevent CPU bottleneck while not overwhelming the system
-    num_workers = min(4, mp.cpu_count() // 2) if torch.cuda.is_available() else 0
+    # Optimize num_workers: scale with GPU count to prevent CPU/GPU imbalance
+    if torch.cuda.is_available():
+        cpu_count = mp.cpu_count()
+        # Reserve 2 cores per GPU for worker threads, rest for OS
+        num_workers = min(6, max(2, (cpu_count - opts.gpus - 2) // opts.gpus))
+        print(f"Auto-scaling num_workers to {num_workers} based on {opts.gpus} GPU(s) and {cpu_count} CPU cores")
+    else:
+        num_workers = 0
     
     val_loader = DataLoader(
         val_dataset,
@@ -133,14 +160,14 @@ def load_dataset(config_dict, opts):
         num_workers=num_workers,  # Enable workers for GPU performance
         pin_memory=torch.cuda.is_available(),  # Pin memory for GPU transfer
         sampler=val_sampler,
-        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch 2 batches
+        prefetch_factor=max(2, 4 if num_workers > 0 else 0),  # Prefetch 4 batches for better overlap
         persistent_workers=(num_workers > 0)  # Keep workers alive
     )
 
     print("Finish loading dataset ...")
     print("Test set statistics:")
     print(f'\n\tNumber of test videos: {len(val_dataset)}')
-    print(f'\tDataLoader: num_workers={num_workers}, pin_memory={torch.cuda.is_available()}')
+    print(f'\tDataLoader: num_workers={num_workers}, prefetch_factor={max(2, 4 if num_workers > 0 else 0)}, pin_memory={torch.cuda.is_available()}')
     if opts.distributed:
         print(f'\tGPU {opts.global_rank} will process {len(val_sampler)} videos')
     return val_loader
@@ -188,27 +215,36 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
             chunk_gt = val_data['gt'][:, start_idx:end_idx, :, :, :]
 
             # Move to device asynchronously
+            device = None
             if torch.cuda.is_available():
-                chunk_lq = chunk_lq.cuda(non_blocking=True)
-                chunk_gt = chunk_gt.cuda(non_blocking=True)
+                if opts.distributed:
+                    device = torch.device(f'cuda:{opts.local_rank}')
+                else:
+                    device = torch.device('cuda:0')
+                chunk_lq = chunk_lq.to(device, non_blocking=True)
+                chunk_gt = chunk_gt.to(device, non_blocking=True)
 
-            # Process chunk
+            # Priority 2 Optimization: Async GPU computation and transfer
+            # Process chunk and move output to CPU asynchronously
             with torch.no_grad():
                 try:
                     chunk_output = model(chunk_lq)
                     
-                    # Synchronize GPU to ensure computation is done
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    
-                    # Move to CPU
-                    chunk_output = chunk_output.cpu()
-                    chunk_gt = chunk_gt.cpu()
+                    # Move to CPU asynchronously (start transfer, don't wait for it yet)
+                    chunk_output_cpu = chunk_output.cpu()
+                    chunk_gt_cpu = chunk_gt.cpu()
                 except RuntimeError as e:
                     print(f"Warning: runtime error for frames {start_idx}-{end_idx}: {e}")
                     # Fallback: just copy input if model fails
-                    chunk_output = chunk_lq.cpu().clone()
-                    chunk_gt = chunk_gt.cpu()
+                    chunk_output_cpu = chunk_lq.cpu().clone()
+                    chunk_gt_cpu = chunk_gt.cpu()
+                
+                # Synchronize GPU only when we need the data (overlaps with I/O)
+                if device is not None:
+                    torch.cuda.synchronize()
+                
+                chunk_output = chunk_output_cpu
+                chunk_gt = chunk_gt_cpu
 
             # Denormalize if needed (vectorized)
             if config_dict['datasets']['val']['normalizing']:
@@ -243,13 +279,16 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
             # Update progress bar
             frame_pbar.update(current_batch_size)
 
-            # Aggressive memory cleanup for the chunk
-            del chunk_lq, chunk_gt, chunk_output
-            if torch.cuda.is_available():
+            # Priority 2 Optimization: Selective memory cleanup (less frequent)
+            # Only empty cache every 10 chunks to reduce overhead
+            del chunk_lq, chunk_gt, chunk_output, chunk_output_cpu, chunk_gt_cpu
+            
+            if torch.cuda.is_available() and start_idx % (opts.temporal_length * 10) == 0:
                 torch.cuda.empty_cache()
             
-            # Periodic garbage collection
-            gc.collect()
+            # Less frequent garbage collection (every 20 frames)
+            if start_idx % (opts.temporal_length * 20) == 0:
+                gc.collect()
 
         frame_pbar.close()
 
@@ -271,14 +310,17 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
                                      'test_results_' + str(opts.temporal_length) + "_rec" + str(recursion_step),
                                      test_clip_par_folder, clip_name + '.avi')
 
-        print(f"Converting frames to video for {clip_name}")
-        frame_to_video(input_clip_url, restored_clip_url, video_save_url)
+        # Priority 1 Optimization: Only master process creates videos (avoid redundant work)
+        # This prevents each GPU from doing the same CPU-intensive task
+        if not opts.distributed or opts.global_rank == 0:
+            print(f"Converting frames to video for {clip_name}")
+            frame_to_video(input_clip_url, restored_clip_url, video_save_url)
 
         # Clean up video data
         del val_data
-        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        gc.collect()
 
     average_psnr = total_psnr / video_count if video_count > 0 else 0.0
     print(f'# Average PSNR: {average_psnr:.2f}')
