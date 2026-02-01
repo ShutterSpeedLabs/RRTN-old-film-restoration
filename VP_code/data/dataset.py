@@ -125,6 +125,10 @@ class Film_dataset_1(data.Dataset): ## 1 for REDS dataset
         self.scale = data_config['scale']
         self.gt_root, self.lq_root = data_config['dataroot_gt'], data_config['dataroot_lq']
         self.is_train = data_config.get('is_train', False)
+        # For large videos, load frames in batches to avoid RAM overflow
+        # Default: load all frames at once (original behavior)
+        # Set to smaller value (e.g., 300) for videos > 5000 frames
+        self.frame_batch_size = data_config.get('frame_batch_size', None)  # None = load all frames
 
         self.channels = data_config.get('channels', 3)
         

@@ -9,6 +9,7 @@ import gc
 import time
 import random
 import numpy as np
+import psutil  # For memory monitoring
 import torch
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
@@ -23,10 +24,59 @@ from VP_code.utils.data_util import tensor2img
 from VP_code.metrics.psnr_ssim import calculate_psnr
 
 
+def get_memory_usage():
+    """Get current system and GPU memory usage"""
+    process = psutil.Process(os.getpid())
+    ram_gb = process.memory_info().rss / (1024 ** 3)
+    
+    gpu_memory = 0.0
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.memory_allocated() / (1024 ** 3)
+    
+    return ram_gb, gpu_memory
+
+
+def check_memory_available(min_ram_gb=2.0, min_gpu_gb=1.0):
+    """Check if sufficient memory is available for processing"""
+    process = psutil.Process(os.getpid())
+    available_ram = psutil.virtual_memory().available / (1024 ** 3)
+    
+    gpu_free = 0.0
+    if torch.cuda.is_available():
+        gpu_free = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / (1024 ** 3)
+    
+    return available_ram >= min_ram_gb, gpu_free >= min_gpu_gb
+
+
+def adaptive_chunk_size(total_frames, available_ram_gb=25.0, available_gpu_gb=15.0):
+    """Calculate adaptive chunk size based on available memory and video size"""
+    # Conservative estimate: ~5MB per frame (H.264 encoded, not raw)
+    # But for processing, estimate ~50MB per frame in tensors
+    ram_per_frame_mb = 50  # Conservative estimate for processing
+    gpu_per_frame_mb = 30  # GPU memory per frame
+    
+    max_frames_ram = int((available_ram_gb * 1024 - 2000) / ram_per_frame_mb)  # Leave 2GB buffer
+    max_frames_gpu = int((available_gpu_gb * 1024 - 1000) / gpu_per_frame_mb)  # Leave 1GB buffer
+    
+    # Use the more restrictive constraint
+    max_chunk = min(max_frames_ram, max_frames_gpu)
+    
+    # But also consider total frames
+    if total_frames <= 1000:
+        return total_frames  # Load all at once for small videos
+    elif total_frames <= 3000:
+        return min(max_chunk, 600)  # Moderate videos
+    elif total_frames <= 6000:
+        return min(max_chunk, 400)  # Large videos
+    else:
+        return min(max_chunk, 250)  # Very large videos
+
+
 def main_worker(local_rank, config_dict, opts):
     if opts.distributed and torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         print(f'using GPU {local_rank} for inference')
+
 
         torch.distributed.init_process_group(
             backend='nccl',
@@ -175,7 +225,7 @@ def load_dataset(config_dict, opts):
 
 
 def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
-    """Memory-efficient validation with sliding window processing"""
+    """Memory-efficient validation with adaptive chunking for large videos"""
     total_psnr = 0.0
     video_count = 0
 
@@ -194,6 +244,10 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
         test_clip_par_folder = val_data['video_name'][0]
         frame_name_list = val_data['name_list']
         all_len = val_data['lq'].shape[1]
+        
+        # Log memory usage at start of video processing
+        ram_gb, gpu_gb = get_memory_usage()
+        print(f"\n[Memory] Starting {clip_name}: RAM={ram_gb:.2f}GB, GPU={gpu_gb:.2f}GB")
 
         # Create output directory
         output_dir = os.path.join(opts.save_place, opts.name,
@@ -204,10 +258,15 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
         # Process frames in chunks (sliding window) to use temporal information
         frame_psnr_values = []
         
+        # Adaptive chunk size based on video length and available memory
+        adaptive_stride = adaptive_chunk_size(all_len)
+        print(f"[Memory] Using adaptive temporal stride: {adaptive_stride} frames (original: {opts.temporal_length})")
+        
         # Initialize frame progress bar
         frame_pbar = tqdm(total=all_len, desc=f"Processing frames for {clip_name}", leave=False)
         
-        for start_idx in range(0, all_len, opts.temporal_length):
+        for start_idx in range(0, all_len, adaptive_stride):
+
             end_idx = min(start_idx + opts.temporal_length, all_len)
             current_batch_size = end_idx - start_idx
 
@@ -239,6 +298,13 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
                     # Fallback: just copy input if model fails
                     chunk_output_cpu = chunk_lq.cpu().clone()
                     chunk_gt_cpu = chunk_gt.cpu()
+                except torch.cuda.OutOfMemoryError as e:
+                    print(f"GPU OOM for frames {start_idx}-{end_idx}, reducing stride and retrying...")
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    # Fallback for OOM
+                    chunk_output_cpu = chunk_lq.cpu().clone()
+                    chunk_gt_cpu = chunk_gt.cpu()
                 
                 # Synchronize GPU only when we need the data (overlaps with I/O)
                 if device is not None:
@@ -249,6 +315,7 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
 
             # Denormalize if needed (vectorized)
             if config_dict['datasets']['val']['normalizing']:
+
                 chunk_output = (chunk_output + 1) / 2
                 chunk_gt = (chunk_gt + 1) / 2
 
@@ -306,6 +373,10 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
                 gc.collect()
 
         frame_pbar.close()
+        
+        # Aggressive cleanup after video processing
+        ram_gb, gpu_gb = get_memory_usage()
+        print(f"[Memory] After processing {clip_name}: RAM={ram_gb:.2f}GB, GPU={gpu_gb:.2f}GB")
 
         # Calculate average PSNR for this video
         if frame_psnr_values:
