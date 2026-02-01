@@ -47,6 +47,7 @@ def modulated_deform_conv2d(x, offset, mask, weight, bias, stride=1,
                            padding=0, dilation=1, groups=1, deform_groups=1):
     """
     Modulated deformable convolution using torchvision's deform_conv2d.
+    Optimized to ensure GPU execution and proper device handling.
     """
     # Normalize parameters
     if isinstance(stride, int):
@@ -57,18 +58,30 @@ def modulated_deform_conv2d(x, offset, mask, weight, bias, stride=1,
         dilation = (dilation, dilation)
     
     try:
-        # Use torchvision's deform_conv2d
+        # Ensure all tensors are on the same device (GPU if available)
+        device = x.device
+        if weight.device != device:
+            weight = weight.to(device)
+        if offset.device != device:
+            offset = offset.to(device)
+        if mask is not None and mask.device != device:
+            mask = mask.to(device)
+        if bias is not None and bias.device != device:
+            bias = bias.to(device)
+        
+        # Use torchvision's deform_conv2d with GPU acceleration
         # Note: torchvision's API requires offset to have shape [B, C*kh*kw*2, H, W]
         # and mask to have shape [B, C*kh*kw, H, W]
-        out = deform_conv2d(
-            x, 
-            offset, 
-            weight, 
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            mask=mask
-        )
+        with torch.cuda.amp.autocast(enabled=x.is_cuda):
+            out = deform_conv2d(
+                x, 
+                offset, 
+                weight, 
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                mask=mask
+            )
         
         # Add bias if present
         if bias is not None:
@@ -77,6 +90,11 @@ def modulated_deform_conv2d(x, offset, mask, weight, bias, stride=1,
         return out
     
     except Exception as e:
-        # Fallback to regular convolution if deform_conv2d fails
+        # Fallback to regular convolution with GPU support if deform_conv2d fails
         print(f"Warning: deform_conv2d failed ({e}), using regular convolution")
+        # Ensure tensors are on correct device for regular conv
+        if weight.device != x.device:
+            weight = weight.to(x.device)
+        if bias is not None and bias.device != x.device:
+            bias = bias.to(x.device)
         return F.conv2d(x, weight, bias, stride, padding, dilation, groups)

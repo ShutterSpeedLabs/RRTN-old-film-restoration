@@ -113,7 +113,7 @@ def load_model(opts, which_model='first'):
 
 
 def load_dataset(config_dict, opts):
-    """Load dataset with distributed sampler support and minimal memory footprint"""
+    """Load dataset with distributed sampler support and optimal memory footprint"""
     val_dataset = Film_dataset_1(config_dict['datasets']['val'])
 
     # Use distributed sampler if in distributed mode
@@ -122,21 +122,25 @@ def load_dataset(config_dict, opts):
     else:
         val_sampler = None
 
-    # Minimize memory usage: no workers, no pin_memory, batch_size=1
+    # Optimize for GPU: use workers for data loading to overlap with GPU computation
+    # Use 2-4 workers to prevent CPU bottleneck while not overwhelming the system
+    num_workers = min(4, mp.cpu_count() // 2) if torch.cuda.is_available() else 0
+    
     val_loader = DataLoader(
         val_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=0,  # Avoid multiprocessing overhead
-        pin_memory=False,  # Reduce memory usage
+        num_workers=num_workers,  # Enable workers for GPU performance
+        pin_memory=torch.cuda.is_available(),  # Pin memory for GPU transfer
         sampler=val_sampler,
-        prefetch_factor=None,  # No prefetching
-        persistent_workers=False
+        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch 2 batches
+        persistent_workers=(num_workers > 0)  # Keep workers alive
     )
 
     print("Finish loading dataset ...")
     print("Test set statistics:")
     print(f'\n\tNumber of test videos: {len(val_dataset)}')
+    print(f'\tDataLoader: num_workers={num_workers}, pin_memory={torch.cuda.is_available()}')
     if opts.distributed:
         print(f'\tGPU {opts.global_rank} will process {len(val_sampler)} videos')
     return val_loader
@@ -183,22 +187,28 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
             chunk_lq = val_data['lq'][:, start_idx:end_idx, :, :, :]
             chunk_gt = val_data['gt'][:, start_idx:end_idx, :, :, :]
 
-            # Move to device
+            # Move to device asynchronously
             if torch.cuda.is_available():
-                chunk_lq = chunk_lq.cuda()
+                chunk_lq = chunk_lq.cuda(non_blocking=True)
+                chunk_gt = chunk_gt.cuda(non_blocking=True)
 
             # Process chunk
             with torch.no_grad():
                 try:
                     chunk_output = model(chunk_lq)
-                    # Move to CPU immediately
+                    
+                    # Synchronize GPU to ensure computation is done
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    # Move to CPU
                     chunk_output = chunk_output.cpu()
-                    chunk_lq_cpu = chunk_lq.cpu() # Keep reference for cleanup
+                    chunk_gt = chunk_gt.cpu()
                 except RuntimeError as e:
                     print(f"Warning: runtime error for frames {start_idx}-{end_idx}: {e}")
                     # Fallback: just copy input if model fails
                     chunk_output = chunk_lq.cpu().clone()
-                    chunk_lq_cpu = chunk_lq.cpu()
+                    chunk_gt = chunk_gt.cpu()
 
             # Denormalize if needed (vectorized)
             if config_dict['datasets']['val']['normalizing']:
@@ -234,7 +244,7 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
             frame_pbar.update(current_batch_size)
 
             # Aggressive memory cleanup for the chunk
-            del chunk_lq, chunk_gt, chunk_output, chunk_lq_cpu
+            del chunk_lq, chunk_gt, chunk_output
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
