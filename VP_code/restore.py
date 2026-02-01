@@ -8,6 +8,7 @@ from tqdm import tqdm
 import gc
 import time
 import random
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
@@ -265,12 +266,26 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
                 gt_img = tensor2img(gt_tensor)
                 sr_img = tensor2img(sr_tensor)
 
+                # Validate images before saving
+                if sr_img is None or gt_img is None:
+                    print(f"Warning: Failed to convert tensors for frame {frame_name}")
+                    continue
+                
+                if np.all(sr_img == 0) or np.all(gt_img == 0):
+                    print(f"Warning: Frame {frame_name} is all zeros (might be black frame)")
+
                 # Save image immediately
                 save_path = os.path.join(output_dir, frame_name)
                 cv2.imwrite(save_path, sr_img)
 
                 # Calculate PSNR for this frame
                 frame_psnr = calculate_psnr(sr_img, gt_img)
+                # Handle inf values (perfect match) by using a large but finite value
+                if np.isinf(frame_psnr):
+                    frame_psnr = 100.0  # Cap at 100 for perfect reconstruction
+                elif np.isnan(frame_psnr):
+                    frame_psnr = 0.0  # Invalid PSNR, use 0
+                    print(f"Warning: NaN PSNR calculated for frame {frame_name}")
                 frame_psnr_values.append(frame_psnr)
                 
                 # Clean up extracted numpy arrays
@@ -293,7 +308,12 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
         frame_pbar.close()
 
         # Calculate average PSNR for this video
-        video_psnr = sum(frame_psnr_values) / len(frame_psnr_values) if frame_psnr_values else 0.0
+        if frame_psnr_values:
+            video_psnr = sum(frame_psnr_values) / len(frame_psnr_values)
+        else:
+            video_psnr = 0.0
+            print(f"Warning: No PSNR values calculated for {clip_name}")
+        
         total_psnr += video_psnr
         video_count += 1
 
