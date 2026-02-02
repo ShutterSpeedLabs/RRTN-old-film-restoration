@@ -15,6 +15,11 @@ import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+import resource  # For file descriptor management
+
+# Disable PyTorch multiprocessing and shared memory to prevent file descriptor issues
+os.environ['TORCH_DISABLE_SHARING'] = '1'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
 sys.path.append(os.path.dirname(sys.path[0]))
 
@@ -48,7 +53,7 @@ def check_memory_available(min_ram_gb=2.0, min_gpu_gb=1.0):
     return available_ram >= min_ram_gb, gpu_free >= min_gpu_gb
 
 
-def adaptive_chunk_size(total_frames, available_ram_gb=25.0, available_gpu_gb=15.0):
+def adaptive_chunk_size(total_frames, available_ram_gb=25.0, available_gpu_gb=15.0, temporal_length=15):
     """Calculate adaptive chunk size based on available memory and video size"""
     # Conservative estimate: ~5MB per frame (H.264 encoded, not raw)
     # But for processing, estimate ~50MB per frame in tensors
@@ -61,15 +66,15 @@ def adaptive_chunk_size(total_frames, available_ram_gb=25.0, available_gpu_gb=15
     # Use the more restrictive constraint
     max_chunk = min(max_frames_ram, max_frames_gpu)
     
-    # But also consider total frames
-    if total_frames <= 1000:
-        return total_frames  # Load all at once for small videos
-    elif total_frames <= 3000:
-        return min(max_chunk, 600)  # Moderate videos
-    elif total_frames <= 6000:
-        return min(max_chunk, 400)  # Large videos
-    else:
-        return min(max_chunk, 250)  # Very large videos
+    # Be much more conservative - start with temporal_length and only increase if necessary
+    if total_frames <= temporal_length * 2:  # Very small videos
+        return total_frames
+    elif total_frames <= temporal_length * 10:  # Small to medium videos
+        return min(temporal_length * 2, max_chunk)  # Double temporal_length at most
+    elif total_frames <= temporal_length * 20:  # Medium videos
+        return min(temporal_length * 3, max_chunk)  # Triple temporal_length at most
+    else:  # Large videos - be very conservative
+        return min(temporal_length * 4, max_chunk)  # Quadruple temporal_length at most
 
 
 def main_worker(local_rank, config_dict, opts):
@@ -195,12 +200,12 @@ def load_dataset(config_dict, opts):
     else:
         val_sampler = None
 
-    # Optimize num_workers: scale with GPU count to prevent CPU/GPU imbalance
+    # Optimize num_workers: disable multiprocessing completely to prevent file descriptor issues
     if torch.cuda.is_available():
         cpu_count = mp.cpu_count()
-        # Reserve 2 cores per GPU for worker threads, rest for OS
-        num_workers = min(6, max(2, (cpu_count - opts.gpus - 2) // opts.gpus))
-        print(f"Auto-scaling num_workers to {num_workers} based on {opts.gpus} GPU(s) and {cpu_count} CPU cores")
+        # Use 0 workers (single-threaded) to completely avoid file descriptor issues
+        num_workers = 0
+        print(f"Using num_workers=0 (single-threaded) to prevent file descriptor issues (CPU cores: {cpu_count})")
     else:
         num_workers = 0
     
@@ -208,17 +213,17 @@ def load_dataset(config_dict, opts):
         val_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=num_workers,  # Enable workers for GPU performance
+        num_workers=num_workers,  # Single-threaded operation
         pin_memory=torch.cuda.is_available(),  # Pin memory for GPU transfer
         sampler=val_sampler,
-        prefetch_factor=max(2, 4 if num_workers > 0 else 0),  # Prefetch 4 batches for better overlap
-        persistent_workers=(num_workers > 0)  # Keep workers alive
+        prefetch_factor=None,  # None for single-threaded
+        persistent_workers=False  # Disable persistent workers
     )
 
     print("Finish loading dataset ...")
     print("Test set statistics:")
     print(f'\n\tNumber of test videos: {len(val_dataset)}')
-    print(f'\tDataLoader: num_workers={num_workers}, prefetch_factor={max(2, 4 if num_workers > 0 else 0)}, pin_memory={torch.cuda.is_available()}')
+    print(f'\tDataLoader: num_workers={num_workers}, prefetch_factor=None, pin_memory={torch.cuda.is_available()} (single-threaded)')
     if opts.distributed:
         print(f'\tGPU {opts.global_rank} will process {len(val_sampler)} videos')
     return val_loader
@@ -258,14 +263,17 @@ def validation(opts, config_dict, loaded_model, val_loader, recursion_step=1):
         # Process frames in chunks (sliding window) to use temporal information
         frame_psnr_values = []
         
-        # Adaptive chunk size based on video length and available memory
-        adaptive_stride = adaptive_chunk_size(all_len)
-        print(f"[Memory] Using adaptive temporal stride: {adaptive_stride} frames (original: {opts.temporal_length})")
+        # Use the original temporal_length for sliding window stride to ensure all frames are processed
+        # The chunk loading in the dataset handles memory management
+        sliding_stride = opts.temporal_stride if hasattr(opts, 'temporal_stride') else 3
+        
+        print(f"[Memory] Using sliding stride: {sliding_stride} frames (temporal_length: {opts.temporal_length})")
+        print(f"[Memory] Dataset will handle chunk loading with frame_batch_size: {config_dict['datasets']['val'].get('frame_batch_size', 'all')}")
         
         # Initialize frame progress bar
         frame_pbar = tqdm(total=all_len, desc=f"Processing frames for {clip_name}", leave=False)
         
-        for start_idx in range(0, all_len, adaptive_stride):
+        for start_idx in range(0, all_len, sliding_stride):
 
             end_idx = min(start_idx + opts.temporal_length, all_len)
             current_batch_size = end_idx - start_idx
@@ -494,15 +502,9 @@ if __name__ == '__main__':
     if torch.cuda.is_available():
         available_gpus = torch.cuda.device_count()
         
-        # If not specified, use all available GPUs (up to 2)
-        if opts.gpus is None:
-            opts.gpus = min(available_gpus, 2)
-            print(f"Auto-detected {available_gpus} GPU(s), using {opts.gpus} for inference")
-        elif opts.gpus > available_gpus:
-            print(f"Warning: Requested {opts.gpus} GPUs but only {available_gpus} available. Using {available_gpus} GPUs.")
-            opts.gpus = available_gpus
-        else:
-            print(f"Using {opts.gpus} GPU(s) for inference")
+        # Force single GPU mode to prevent file descriptor issues
+        opts.gpus = 1
+        print(f"Force using 1 GPU (available: {available_gpus}) to prevent file descriptor issues")
     else:
         print("Warning: CUDA not available, falling back to CPU")
         opts.gpus = 1
@@ -517,15 +519,9 @@ if __name__ == '__main__':
         port_num = str(random.randint(20000, 30000))
         opts.dist_url = 'tcp://127.0.0.1:' + port_num
 
-    # Validate GPU setup
-    if opts.gpus > 1 and not torch.cuda.is_available():
-        print("Error: Multiple GPUs requested but CUDA is not available. Using single GPU mode.")
-        opts.gpus = 1
-        opts.distributed = False
-    elif opts.gpus == 1:
-        opts.distributed = False
-    else:
-        opts.distributed = True
+    # Validate GPU setup - force single GPU, non-distributed mode
+    opts.distributed = False
+    print("Force disabled distributed mode to prevent file descriptor issues")
 
     if opts.distributed:
         mp.spawn(main_worker, nprocs=opts.gpus, args=(config_dict, opts,))
